@@ -9,9 +9,10 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
-    @StateObject private var todoService = TodoService.shared
+    @StateObject private var setStore = SetStore.shared
+    @StateObject private var todoStore = TodoStore.shared
     @State private var isCreateSetModalPresented = false
-    
+
     var body: some View {
         VStack {
             HStack {
@@ -24,7 +25,7 @@ struct ContentView: View {
             .padding(.horizontal)
 
             AddTodoUI()
-            SetUI(sets: todoService.sets, todos: todoService.todos)
+            SetUI(sets: setStore.sets, todos: todoStore.todos)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .padding()
@@ -37,7 +38,8 @@ struct ContentView: View {
         }
         .onAppear {
             do {
-                try todoService.load()
+                try setStore.load()
+                try todoStore.load()
             } catch {
                 print("Failed to load todos: \(error)")
             }
@@ -60,7 +62,7 @@ private func setPath(for set: Set, in sets: [Set]) -> String {
 
 private struct TodoReorderDropDelegate: DropDelegate {
     let targetTodoId: Int
-    let todoService: TodoService
+    let todoStore: TodoStore
 
     func performDrop(info: DropInfo) -> Bool {
         guard let provider = info.itemProviders(for: [.text]).first else {
@@ -74,7 +76,7 @@ private struct TodoReorderDropDelegate: DropDelegate {
 
             DispatchQueue.main.async {
                 do {
-                    try todoService.moveTodo(draggedId: draggedId, beforeId: targetTodoId)
+                    try todoStore.moveTodo(draggedId: draggedId, beforeId: targetTodoId)
                 } catch {
                     print("Failed to reorder todo: \(error)")
                 }
@@ -87,7 +89,7 @@ private struct TodoReorderDropDelegate: DropDelegate {
 
 private struct TodoSetDropDelegate: DropDelegate {
     let setId: Int?
-    let todoService: TodoService
+    let todoStore: TodoStore
 
     func performDrop(info: DropInfo) -> Bool {
         guard let provider = info.itemProviders(for: [.text]).first else {
@@ -101,7 +103,7 @@ private struct TodoSetDropDelegate: DropDelegate {
 
             DispatchQueue.main.async {
                 do {
-                    try todoService.moveTodo(draggedId: draggedId, toSetId: setId)
+                    try todoStore.moveTodo(draggedId: draggedId, toSetId: setId)
                 } catch {
                     print("Failed to move todo: \(error)")
                 }
@@ -113,12 +115,13 @@ private struct TodoSetDropDelegate: DropDelegate {
 }
 
 struct AddTodoUI: View {
-    @StateObject private var todoService = TodoService.shared
+    @ObservedObject private var setStore = SetStore.shared
+    private let todoStore = TodoStore.shared
     @State private var todoContent: String = ""
     @State private var selectedSetId: Int? = nil
 
     private var availableSets: [Set] {
-        todoService.sets
+        setStore.sets
             .sorted { $0.id < $1.id }
     }
 
@@ -157,7 +160,7 @@ struct AddTodoUI: View {
         }
 
         do {
-            try todoService.addTodo(
+            try todoStore.addTodo(
                 content: trimmedContent,
                 setId: selectedSetId
             )
@@ -170,7 +173,7 @@ struct AddTodoUI: View {
 }
 
 struct SetUI: View {
-    @ObservedObject private var todoService = TodoService.shared
+    private let todoStore = TodoStore.shared
     let sets: [Set]
     let todos: [Todo]
 
@@ -212,10 +215,10 @@ struct SetUI: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .onDrop(of: [.text], delegate: TodoSetDropDelegate(setId: nil, todoService: todoService))
+            .onDrop(of: [.text], delegate: TodoSetDropDelegate(setId: nil, todoStore: todoStore))
 
             ForEach(topLevelSets) { set in
-                setSection(for: set, indentLevel: 0)
+                SetSectionView(set: set, sets: sets, todos: todos, indentLevel: 0, collapsedSetIds: $collapsedSetIds)
             }
 
             if !doneTodos.isEmpty {
@@ -262,90 +265,105 @@ struct SetUI: View {
                 .stroke(Color(hex: "#34C759").opacity(0.55), lineWidth: 2)
         }
     }
+}
 
-    private func setSection(for set: Set, indentLevel: Int) -> AnyView {
-        let isCollapsed = collapsedSetIds.contains(set.id)
+private struct SetSectionView: View {
+    private let setStore = SetStore.shared
+    private let todoStore = TodoStore.shared
+    let set: Set
+    let sets: [Set]
+    let todos: [Todo]
+    let indentLevel: Int
+    @Binding var collapsedSetIds: Swift.Set<Int>
 
-        return AnyView(
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Button {
-                        toggleCollapsed(set.id)
-                    } label: {
-                        Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
-                            .foregroundStyle(.secondary)
-                            .font(.system(size: 12, weight: .semibold))
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(isCollapsed ? "Expand set" : "Collapse set")
-
-                    Text(set.name)
-                        .font(.headline)
-
-                    Spacer()
-
-                    Menu {
-                        Button("Delete", role: .destructive) {
-                            deleteSet(set.id)
-                        }
-                    } label: {
-                        Image(systemName: "ellipsis.circle")
-                            .foregroundStyle(.secondary)
-                    }
-                    .menuStyle(.borderlessButton)
-                    .menuIndicator(.hidden)
-                    .fixedSize()
-                    .accessibilityLabel("Set options")
-                }
-
-                if !isCollapsed {
-                    ForEach(todos.filter { $0.setId == set.id && !$0.done }) { todo in
-                        TodoUI(todo: todo)
-                    }
-
-                    ForEach(childSets(of: set)) { childSet in
-                        setSection(for: childSet, indentLevel: indentLevel + 1)
-                    }
-                }
-            }
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.regularMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Color(hex: set.color ?? "#D1D1D6").opacity(0.55), lineWidth: 2)
-            }
-            .padding(.leading, CGFloat(indentLevel) * 24)
-            .onDrop(of: [.text], delegate: TodoSetDropDelegate(setId: set.id, todoService: todoService))
-        )
+    private var isCollapsed: Bool {
+        collapsedSetIds.contains(set.id)
     }
 
-    private func childSets(of set: Set) -> [Set] {
+    private var setTodos: [Todo] {
+        todos.filter { $0.setId == set.id && !$0.done }
+    }
+
+    private var childSets: [Set] {
         sets
             .filter { $0.subsetId == set.id }
             .sorted { $0.id < $1.id }
     }
 
-    private func deleteSet(_ id: Int) {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Button {
+                    toggleCollapsed()
+                } label: {
+                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                        .foregroundStyle(.secondary)
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(isCollapsed ? "Expand set" : "Collapse set")
+
+                Text(set.name)
+                    .font(.headline)
+
+                Spacer()
+
+                Menu {
+                    Button("Delete", role: .destructive) {
+                        deleteSet()
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .foregroundStyle(.secondary)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .accessibilityLabel("Set options")
+            }
+
+            if !isCollapsed {
+                ForEach(setTodos) { todo in
+                    TodoUI(todo: todo)
+                }
+
+                ForEach(childSets) { childSet in
+                    SetSectionView(set: childSet, sets: sets, todos: todos, indentLevel: indentLevel + 1, collapsedSetIds: $collapsedSetIds)
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color(hex: set.color ?? "#D1D1D6").opacity(0.55), lineWidth: 2)
+        }
+        .padding(.leading, CGFloat(indentLevel) * 24)
+        .onDrop(of: [.text], delegate: TodoSetDropDelegate(setId: set.id, todoStore: todoStore))
+    }
+
+    private func deleteSet() {
         do {
-            try todoService.deleteSet(id: id)
+            try setStore.deleteSet(id: set.id)
         } catch {
             print("Failed to delete set: \(error)")
         }
     }
 
-    private func toggleCollapsed(_ id: Int) {
-        if collapsedSetIds.contains(id) {
-            collapsedSetIds.remove(id)
+    private func toggleCollapsed() {
+        if collapsedSetIds.contains(set.id) {
+            collapsedSetIds.remove(set.id)
         } else {
-            collapsedSetIds.insert(id)
+            collapsedSetIds.insert(set.id)
         }
     }
 }
 
 struct TodoUI: View {
-    @ObservedObject private var todoService = TodoService.shared
+    @ObservedObject private var setStore = SetStore.shared
+    private let todoStore = TodoStore.shared
     let todo: Todo
 
     @State private var isEditing = false
@@ -353,7 +371,7 @@ struct TodoUI: View {
     @FocusState private var isContentFocused: Bool
 
     private var availableSets: [Set] {
-        todoService.sets.sorted { $0.id < $1.id }
+        setStore.sets.sorted { $0.id < $1.id }
     }
 
     var body: some View {
@@ -393,7 +411,7 @@ struct TodoUI: View {
                     .onDrag {
                         NSItemProvider(object: String(todo.id) as NSString)
                     }
-                    .onDrop(of: [.text], delegate: TodoReorderDropDelegate(targetTodoId: todo.id, todoService: todoService))
+                    .onDrop(of: [.text], delegate: TodoReorderDropDelegate(targetTodoId: todo.id, todoStore: todoStore))
             }
 
             if todo.setId == nil, !availableSets.isEmpty {
@@ -415,7 +433,7 @@ struct TodoUI: View {
 
             Button(role: .destructive) {
                 do {
-                    try todoService.deleteTodo(id: todo.id)
+                    try todoStore.deleteTodo(id: todo.id)
                 } catch {
                     print("Failed to delete todo: \(error)")
                 }
@@ -434,9 +452,9 @@ struct TodoUI: View {
     private func toggleDone() {
         do {
             if todo.done {
-                try todoService.undoTodo(id: todo.id)
+                try todoStore.undoTodo(id: todo.id)
             } else {
-                try todoService.markTodoAsDone(id: todo.id)
+                try todoStore.markTodoAsDone(id: todo.id)
             }
         } catch {
             print("Failed to update todo: \(error)")
@@ -445,7 +463,7 @@ struct TodoUI: View {
 
     private func assignToSet(_ setId: Int) {
         do {
-            try todoService.updateTodo(
+            try todoStore.updateTodo(
                 Todo(id: todo.id, setId: setId, content: todo.content, done: todo.done)
             )
         } catch {
@@ -473,7 +491,7 @@ struct TodoUI: View {
         }
 
         do {
-            try todoService.updateTodo(
+            try todoStore.updateTodo(
                 Todo(id: todo.id, setId: todo.setId, content: trimmedContent, done: todo.done)
             )
         } catch {
@@ -518,14 +536,14 @@ extension Color {
 
 struct CreateSetModal: View {
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject private var todoService = TodoService.shared
+    @ObservedObject private var setStore = SetStore.shared
 
     @State private var setName = ""
     @State private var parentSetId: Int? = nil
     @State private var selectedColor = Color(hex: "#007AFF")
 
     private var availableParentSets: [Set] {
-        todoService.sets.sorted { $0.id < $1.id }
+        setStore.sets.sorted { $0.id < $1.id }
     }
 
     private var isSetNameEmpty: Bool {
@@ -580,7 +598,7 @@ struct CreateSetModal: View {
         }
 
         do {
-            _ = try todoService.addSet(
+            _ = try setStore.addSet(
                 name: setName.trimmingCharacters(in: .whitespacesAndNewlines),
                 color: selectedColor.toHex() ?? "#007AFF",
                 subsetId: parentSetId

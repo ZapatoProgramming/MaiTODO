@@ -2,49 +2,20 @@ import Foundation
 import Combine
 
 @MainActor
-final class TodoService: ObservableObject {
-    static let shared = TodoService()
+final class TodoStore: ObservableObject {
+    static let shared = TodoStore()
 
-    private static let setsFilename = "sets.json"
     private static let todosFilename = "todo.json"
-    private static let legacyDoneSetId = -1
 
-    @Published private(set) var sets: [Set] = []
     @Published private(set) var todos: [Todo] = []
 
-    private var nextSetId = 1
     private var nextTodoId = 1
 
     private init() {}
 
     func load() throws {
-        sets = try JSONRepository.read(Set.self, from: Self.setsFilename)
         todos = try JSONRepository.read(Todo.self, from: Self.todosFilename)
-
-        if sets.contains(where: { $0.id == Self.legacyDoneSetId }) {
-            sets.removeAll { $0.id == Self.legacyDoneSetId }
-            try saveSets()
-        }
-
-        nextSetId = max((sets.map(\.id).max() ?? 0) + 1, 1)
         nextTodoId = (todos.map(\.id).max() ?? 0) + 1
-    }
-
-    func addSet(name: String, color: String? = nil, subsetId: Int? = nil) throws -> Int {
-        let createdSetId = nextSetId
-
-        let newSet = Set(
-            id: createdSetId,
-            color: color,
-            subsetId: subsetId,
-            name: name
-        )
-
-        nextSetId += 1
-        sets.append(newSet)
-
-        try saveSets()
-        return createdSetId
     }
 
     func addTodo(content: String, setId: Int? = nil) throws {
@@ -89,15 +60,6 @@ final class TodoService: ObservableObject {
         )
 
         try saveTodos()
-    }
-
-    func updateSet(_ updatedSet: Set) throws {
-        guard let index = sets.firstIndex(where: { $0.id == updatedSet.id }) else {
-            return
-        }
-
-        sets[index] = updatedSet
-        try saveSets()
     }
 
     func updateTodo(_ updatedTodo: Todo) throws {
@@ -147,18 +109,9 @@ final class TodoService: ObservableObject {
         try saveTodos()
     }
 
-    func deleteSet(id: Int) throws {
-        sets.removeAll { $0.id == id }
-        try saveSets()
-    }
-
     func deleteTodo(id: Int) throws {
         todos.removeAll { $0.id == id }
         try saveTodos()
-    }
-
-    private func saveSets() throws {
-        try JSONRepository.write(sets, to: Self.setsFilename)
     }
 
     private func saveTodos() throws {
