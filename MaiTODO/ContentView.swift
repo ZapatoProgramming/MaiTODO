@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var todoService = TodoService.shared
@@ -44,6 +45,73 @@ struct ContentView: View {
     }
 }
 
+private func setPath(for set: Set, in sets: [Set]) -> String {
+    var names = [set.name]
+    var currentParentId = set.subsetId
+
+    while let parentId = currentParentId,
+          let parentSet = sets.first(where: { $0.id == parentId }) {
+        names.insert(parentSet.name, at: 0)
+        currentParentId = parentSet.subsetId
+    }
+
+    return names.joined(separator: " - ")
+}
+
+private struct TodoReorderDropDelegate: DropDelegate {
+    let targetTodoId: Int
+    let todoService: TodoService
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard let provider = info.itemProviders(for: [.text]).first else {
+            return false
+        }
+
+        provider.loadObject(ofClass: NSString.self) { reading, _ in
+            guard let idString = reading as? String, let draggedId = Int(idString) else {
+                return
+            }
+
+            DispatchQueue.main.async {
+                do {
+                    try todoService.moveTodo(draggedId: draggedId, beforeId: targetTodoId)
+                } catch {
+                    print("Failed to reorder todo: \(error)")
+                }
+            }
+        }
+
+        return true
+    }
+}
+
+private struct TodoSetDropDelegate: DropDelegate {
+    let setId: Int?
+    let todoService: TodoService
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard let provider = info.itemProviders(for: [.text]).first else {
+            return false
+        }
+
+        provider.loadObject(ofClass: NSString.self) { reading, _ in
+            guard let idString = reading as? String, let draggedId = Int(idString) else {
+                return
+            }
+
+            DispatchQueue.main.async {
+                do {
+                    try todoService.moveTodo(draggedId: draggedId, toSetId: setId)
+                } catch {
+                    print("Failed to move todo: \(error)")
+                }
+            }
+        }
+
+        return true
+    }
+}
+
 struct AddTodoUI: View {
     @StateObject private var todoService = TodoService.shared
     @State private var todoContent: String = ""
@@ -51,7 +119,6 @@ struct AddTodoUI: View {
 
     private var availableSets: [Set] {
         todoService.sets
-            .filter { $0.id != -1 }
             .sorted { $0.id < $1.id }
     }
 
@@ -68,7 +135,7 @@ struct AddTodoUI: View {
                     .tag(nil as Int?)
 
                 ForEach(availableSets) { set in
-                    Text(setPath(for: set))
+                    Text(setPath(for: set, in: availableSets))
                         .tag(set.id as Int?)
                 }
             }
@@ -100,89 +167,145 @@ struct AddTodoUI: View {
             print("Failed to create todo \(error)")
         }
     }
-
-    private func setPath(for set: Set) -> String {
-        var names = [set.name]
-        var currentParentId = set.subsetId
-
-        while let parentId = currentParentId,
-              let parentSet = availableSets.first(where: { $0.id == parentId }) {
-            names.insert(parentSet.name, at: 0)
-            currentParentId = parentSet.subsetId
-        }
-
-        return names.joined(separator: " - ")
-    }
 }
 
 struct SetUI: View {
+    @ObservedObject private var todoService = TodoService.shared
     let sets: [Set]
     let todos: [Todo]
 
-    private var doneSet: Set? {
-        sets.first { $0.id == -1 }
-    }
+    @State private var collapsedSetIds: Swift.Set<Int> = []
+    @State private var isDoneCollapsed = false
 
-    private var normalSets: [Set] {
-        sets.filter { $0.id != -1 }
-    }
-
-    private var normalSetIds: Swift.Set<Int> {
-        Swift.Set(normalSets.map(\.id))
+    private var setIds: Swift.Set<Int> {
+        Swift.Set(sets.map(\.id))
     }
 
     private var topLevelSets: [Set] {
-        normalSets
+        sets
             .filter { set in
                 guard let subsetId = set.subsetId else {
                     return true
                 }
 
-                return !normalSetIds.contains(subsetId)
+                return !setIds.contains(subsetId)
             }
             .sorted { $0.id < $1.id }
     }
 
     private var todosWithoutSet: [Todo] {
-        todos.filter { $0.setId == nil }
+        todos.filter { $0.setId == nil && !$0.done }
+    }
+
+    private var doneTodos: [Todo] {
+        todos.filter(\.done)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            if !todosWithoutSet.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Inbox")
-                        .font(.headline)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Inbox")
+                    .font(.headline)
 
-                    ForEach(todosWithoutSet) { todo in
-                        TodoUI(todo: todo)
-                    }
+                ForEach(todosWithoutSet) { todo in
+                    TodoUI(todo: todo)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .onDrop(of: [.text], delegate: TodoSetDropDelegate(setId: nil, todoService: todoService))
 
             ForEach(topLevelSets) { set in
                 setSection(for: set, indentLevel: 0)
             }
 
-            if let doneSet {
-                setSection(for: doneSet, indentLevel: 0)
+            if !doneTodos.isEmpty {
+                doneSection
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func setSection(for set: Set, indentLevel: Int) -> AnyView {
-        AnyView(
-            VStack(alignment: .leading, spacing: 10) {
-                setHeader(for: set)
+    private var doneSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Button {
+                    isDoneCollapsed.toggle()
+                } label: {
+                    Image(systemName: isDoneCollapsed ? "chevron.right" : "chevron.down")
+                        .foregroundStyle(.secondary)
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(isDoneCollapsed ? "Expand Done" : "Collapse Done")
 
-                ForEach(todos.filter { $0.setId == set.id }) { todo in
+                Text("Done")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color(hex: "#34C759"))
+                    .clipShape(Capsule())
+            }
+
+            if !isDoneCollapsed {
+                ForEach(doneTodos) { todo in
                     TodoUI(todo: todo)
                 }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color(hex: "#34C759").opacity(0.55), lineWidth: 2)
+        }
+    }
 
-                ForEach(childSets(of: set)) { childSet in
-                    setSection(for: childSet, indentLevel: indentLevel + 1)
+    private func setSection(for set: Set, indentLevel: Int) -> AnyView {
+        let isCollapsed = collapsedSetIds.contains(set.id)
+
+        return AnyView(
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Button {
+                        toggleCollapsed(set.id)
+                    } label: {
+                        Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                            .foregroundStyle(.secondary)
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(isCollapsed ? "Expand set" : "Collapse set")
+
+                    Text(set.name)
+                        .font(.headline)
+
+                    Spacer()
+
+                    Menu {
+                        Button("Delete", role: .destructive) {
+                            deleteSet(set.id)
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                            .foregroundStyle(.secondary)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .accessibilityLabel("Set options")
+                }
+
+                if !isCollapsed {
+                    ForEach(todos.filter { $0.setId == set.id && !$0.done }) { todo in
+                        TodoUI(todo: todo)
+                    }
+
+                    ForEach(childSets(of: set)) { childSet in
+                        setSection(for: childSet, indentLevel: indentLevel + 1)
+                    }
                 }
             }
             .padding(12)
@@ -194,28 +317,29 @@ struct SetUI: View {
                     .stroke(Color(hex: set.color ?? "#D1D1D6").opacity(0.55), lineWidth: 2)
             }
             .padding(.leading, CGFloat(indentLevel) * 24)
+            .onDrop(of: [.text], delegate: TodoSetDropDelegate(setId: set.id, todoService: todoService))
         )
     }
 
     private func childSets(of set: Set) -> [Set] {
-        normalSets
+        sets
             .filter { $0.subsetId == set.id }
             .sorted { $0.id < $1.id }
     }
 
-    @ViewBuilder
-    private func setHeader(for set: Set) -> some View {
-        if set.id == -1 {
-            Text(set.name)
-                .font(.headline)
-                .foregroundStyle(.white)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(Color(hex: set.color ?? "#34C759"))
-                .clipShape(Capsule())
+    private func deleteSet(_ id: Int) {
+        do {
+            try todoService.deleteSet(id: id)
+        } catch {
+            print("Failed to delete set: \(error)")
+        }
+    }
+
+    private func toggleCollapsed(_ id: Int) {
+        if collapsedSetIds.contains(id) {
+            collapsedSetIds.remove(id)
         } else {
-            Text(set.name)
-                .font(.headline)
+            collapsedSetIds.insert(id)
         }
     }
 }
@@ -223,27 +347,72 @@ struct SetUI: View {
 struct TodoUI: View {
     @ObservedObject private var todoService = TodoService.shared
     let todo: Todo
-    private var isDone: Bool {
-        todo.setId == -1
+
+    @State private var isEditing = false
+    @State private var editedContent = ""
+    @FocusState private var isContentFocused: Bool
+
+    private var availableSets: [Set] {
+        todoService.sets.sorted { $0.id < $1.id }
     }
 
     var body: some View {
         HStack {
             Button {
-                markTodoAsDone()
+                toggleDone()
             } label: {
-                Image(systemName: isDone ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(isDone ? Color(hex: "#34C759") : .secondary)
+                Image(systemName: todo.done ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(todo.done ? Color(hex: "#34C759") : .secondary)
                     .font(.system(size: 16, weight: .medium))
             }
             .buttonStyle(.plain)
-            .disabled(isDone)
-            .accessibilityLabel(isDone ? "Todo completed" : "Mark todo as done")
+            .accessibilityLabel(todo.done ? "Undo todo" : "Mark todo as done")
 
-            Text(todo.content)
-                .strikethrough(isDone)
-                .foregroundStyle(isDone ? .secondary : .primary)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            if isEditing {
+                TextField("Content", text: $editedContent)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($isContentFocused)
+                    .onSubmit {
+                        commitEdit()
+                    }
+                    .onChange(of: isContentFocused) { _, focused in
+                        if !focused {
+                            commitEdit()
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                Text(todo.content)
+                    .strikethrough(todo.done)
+                    .foregroundStyle(todo.done ? .secondary : .primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2) {
+                        startEditing()
+                    }
+                    .onDrag {
+                        NSItemProvider(object: String(todo.id) as NSString)
+                    }
+                    .onDrop(of: [.text], delegate: TodoReorderDropDelegate(targetTodoId: todo.id, todoService: todoService))
+            }
+
+            if todo.setId == nil, !availableSets.isEmpty {
+                Menu {
+                    ForEach(availableSets) { set in
+                        Button(setPath(for: set, in: availableSets)) {
+                            assignToSet(set.id)
+                        }
+                    }
+                } label: {
+                    Image(systemName: "folder")
+                        .foregroundStyle(.secondary)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .accessibilityLabel("Assign todo to a set")
+            }
+
             Button(role: .destructive) {
                 do {
                     try todoService.deleteTodo(id: todo.id)
@@ -262,11 +431,53 @@ struct TodoUI: View {
         .padding(.horizontal)
     }
 
-    private func markTodoAsDone() {
+    private func toggleDone() {
         do {
-            try todoService.markTodoAsDone(id: todo.id)
+            if todo.done {
+                try todoService.undoTodo(id: todo.id)
+            } else {
+                try todoService.markTodoAsDone(id: todo.id)
+            }
         } catch {
-            print("Failed to mark todo as done: \(error)")
+            print("Failed to update todo: \(error)")
+        }
+    }
+
+    private func assignToSet(_ setId: Int) {
+        do {
+            try todoService.updateTodo(
+                Todo(id: todo.id, setId: setId, content: todo.content, done: todo.done)
+            )
+        } catch {
+            print("Failed to assign todo to set: \(error)")
+        }
+    }
+
+    private func startEditing() {
+        editedContent = todo.content
+        isEditing = true
+        isContentFocused = true
+    }
+
+    private func commitEdit() {
+        guard isEditing else {
+            return
+        }
+
+        isEditing = false
+
+        let trimmedContent = editedContent.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmedContent.isEmpty, trimmedContent != todo.content else {
+            return
+        }
+
+        do {
+            try todoService.updateTodo(
+                Todo(id: todo.id, setId: todo.setId, content: trimmedContent, done: todo.done)
+            )
+        } catch {
+            print("Failed to update todo content: \(error)")
         }
     }
 
@@ -314,7 +525,7 @@ struct CreateSetModal: View {
     @State private var selectedColor = Color(hex: "#007AFF")
 
     private var availableParentSets: [Set] {
-        todoService.sets.filter { $0.id != -1 }
+        todoService.sets.sorted { $0.id < $1.id }
     }
 
     private var isSetNameEmpty: Bool {
@@ -338,7 +549,7 @@ struct CreateSetModal: View {
                     .tag(nil as Int?)
 
                 ForEach(availableParentSets) { set in
-                    Text(set.name)
+                    Text(setPath(for: set, in: availableParentSets))
                         .tag(set.id as Int?)
                 }
             }

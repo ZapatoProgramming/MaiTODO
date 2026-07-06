@@ -7,9 +7,7 @@ final class TodoService: ObservableObject {
 
     private static let setsFilename = "sets.json"
     private static let todosFilename = "todo.json"
-    private static let doneSetId = -1
-    private static let doneSetName = "Done"
-    private static let doneSetColor = "#34C759"
+    private static let legacyDoneSetId = -1
 
     @Published private(set) var sets: [Set] = []
     @Published private(set) var todos: [Todo] = []
@@ -23,7 +21,10 @@ final class TodoService: ObservableObject {
         sets = try JSONRepository.read(Set.self, from: Self.setsFilename)
         todos = try JSONRepository.read(Todo.self, from: Self.todosFilename)
 
-        try ensureDoneSetExists()
+        if sets.contains(where: { $0.id == Self.legacyDoneSetId }) {
+            sets.removeAll { $0.id == Self.legacyDoneSetId }
+            try saveSets()
+        }
 
         nextSetId = max((sets.map(\.id).max() ?? 0) + 1, 1)
         nextTodoId = (todos.map(\.id).max() ?? 0) + 1
@@ -50,7 +51,8 @@ final class TodoService: ObservableObject {
         let newTodo = Todo(
             id: nextTodoId,
             setId: setId,
-            content: content
+            content: content,
+            done: false
         )
 
         nextTodoId += 1
@@ -60,16 +62,30 @@ final class TodoService: ObservableObject {
     }
 
     func markTodoAsDone(id: Int) throws {
-        try ensureDoneSetExists()
-
         guard let index = todos.firstIndex(where: { $0.id == id }) else {
             return
         }
 
         todos[index] = Todo(
             id: todos[index].id,
-            setId: Self.doneSetId,
-            content: todos[index].content
+            setId: todos[index].setId,
+            content: todos[index].content,
+            done: true
+        )
+
+        try saveTodos()
+    }
+
+    func undoTodo(id: Int) throws {
+        guard let index = todos.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+
+        todos[index] = Todo(
+            id: todos[index].id,
+            setId: todos[index].setId,
+            content: todos[index].content,
+            done: false
         )
 
         try saveTodos()
@@ -93,6 +109,44 @@ final class TodoService: ObservableObject {
         try saveTodos()
     }
 
+    func moveTodo(draggedId: Int, beforeId: Int) throws {
+        guard draggedId != beforeId,
+              let draggedIndex = todos.firstIndex(where: { $0.id == draggedId }),
+              let targetSetId = todos.first(where: { $0.id == beforeId })?.setId else {
+            return
+        }
+
+        var draggedTodo = todos[draggedIndex]
+        todos.remove(at: draggedIndex)
+
+        if draggedTodo.setId != targetSetId {
+            draggedTodo = Todo(id: draggedTodo.id, setId: targetSetId, content: draggedTodo.content, done: draggedTodo.done)
+        }
+
+        let insertionIndex = todos.firstIndex(where: { $0.id == beforeId }) ?? todos.count
+        todos.insert(draggedTodo, at: insertionIndex)
+
+        try saveTodos()
+    }
+
+    func moveTodo(draggedId: Int, toSetId: Int?) throws {
+        guard let index = todos.firstIndex(where: { $0.id == draggedId }) else {
+            return
+        }
+
+        var draggedTodo = todos[index]
+
+        guard draggedTodo.setId != toSetId else {
+            return
+        }
+
+        todos.remove(at: index)
+        draggedTodo = Todo(id: draggedTodo.id, setId: toSetId, content: draggedTodo.content, done: draggedTodo.done)
+        todos.append(draggedTodo)
+
+        try saveTodos()
+    }
+
     func deleteSet(id: Int) throws {
         sets.removeAll { $0.id == id }
         try saveSets()
@@ -101,22 +155,6 @@ final class TodoService: ObservableObject {
     func deleteTodo(id: Int) throws {
         todos.removeAll { $0.id == id }
         try saveTodos()
-    }
-
-    private func ensureDoneSetExists() throws {
-        guard !sets.contains(where: { $0.id == Self.doneSetId }) else {
-            return
-        }
-
-        let doneSet = Set(
-            id: Self.doneSetId,
-            color: Self.doneSetColor,
-            subsetId: nil,
-            name: Self.doneSetName
-        )
-
-        sets.insert(doneSet, at: 0)
-        try saveSets()
     }
 
     private func saveSets() throws {
