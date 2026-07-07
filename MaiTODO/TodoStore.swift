@@ -15,15 +15,29 @@ final class TodoStore: ObservableObject {
 
     func load() throws {
         todos = try JSONRepository.read(Todo.self, from: Self.todosFilename)
+
+        if todos.contains(where: { $0.order < 0 }) {
+            todos = todos.enumerated().map { index, todo in
+                guard todo.order < 0 else {
+                    return todo
+                }
+
+                return Todo(id: todo.id, setId: todo.setId, content: todo.content, done: todo.done, order: Double(index))
+            }
+
+            try saveTodos()
+        }
+
         nextTodoId = (todos.map(\.id).max() ?? 0) + 1
     }
 
-    func addTodo(content: String, setId: Int? = nil) throws {
+    func addTodo(content: String, setId: Int? = nil, order: Double) throws {
         let newTodo = Todo(
             id: nextTodoId,
             setId: setId,
             content: content,
-            done: false
+            done: false,
+            order: order
         )
 
         nextTodoId += 1
@@ -41,7 +55,8 @@ final class TodoStore: ObservableObject {
             id: todos[index].id,
             setId: todos[index].setId,
             content: todos[index].content,
-            done: true
+            done: true,
+            order: todos[index].order
         )
 
         try saveTodos()
@@ -56,7 +71,8 @@ final class TodoStore: ObservableObject {
             id: todos[index].id,
             setId: todos[index].setId,
             content: todos[index].content,
-            done: false
+            done: false,
+            order: todos[index].order
         )
 
         try saveTodos()
@@ -71,40 +87,13 @@ final class TodoStore: ObservableObject {
         try saveTodos()
     }
 
-    func moveTodo(draggedId: Int, beforeId: Int) throws {
-        guard draggedId != beforeId,
-              let draggedIndex = todos.firstIndex(where: { $0.id == draggedId }),
-              let targetSetId = todos.first(where: { $0.id == beforeId })?.setId else {
-            return
-        }
-
-        var draggedTodo = todos[draggedIndex]
-        todos.remove(at: draggedIndex)
-
-        if draggedTodo.setId != targetSetId {
-            draggedTodo = Todo(id: draggedTodo.id, setId: targetSetId, content: draggedTodo.content, done: draggedTodo.done)
-        }
-
-        let insertionIndex = todos.firstIndex(where: { $0.id == beforeId }) ?? todos.count
-        todos.insert(draggedTodo, at: insertionIndex)
-
-        try saveTodos()
-    }
-
-    func moveTodo(draggedId: Int, toSetId: Int?) throws {
+    func moveTodo(draggedId: Int, toSetId: Int?, order: Double) throws {
         guard let index = todos.firstIndex(where: { $0.id == draggedId }) else {
             return
         }
 
-        var draggedTodo = todos[index]
-
-        guard draggedTodo.setId != toSetId else {
-            return
-        }
-
-        todos.remove(at: index)
-        draggedTodo = Todo(id: draggedTodo.id, setId: toSetId, content: draggedTodo.content, done: draggedTodo.done)
-        todos.append(draggedTodo)
+        let draggedTodo = todos[index]
+        todos[index] = Todo(id: draggedTodo.id, setId: toSetId, content: draggedTodo.content, done: draggedTodo.done, order: order)
 
         try saveTodos()
     }

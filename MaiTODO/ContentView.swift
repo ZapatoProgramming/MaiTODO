@@ -60,25 +60,160 @@ private func setPath(for set: Set, in sets: [Set]) -> String {
     return names.joined(separator: " - ")
 }
 
-private struct TodoReorderDropDelegate: DropDelegate {
-    let targetTodoId: Int
+private enum DragPayload {
+    private static let todoPrefix = "todo-"
+    private static let setPrefix = "set-"
+
+    static func todo(id: Int) -> String {
+        todoPrefix + String(id)
+    }
+
+    static func set(id: Int) -> String {
+        setPrefix + String(id)
+    }
+
+    static func todoId(from payload: String) -> Int? {
+        guard payload.hasPrefix(todoPrefix) else {
+            return nil
+        }
+
+        return Int(payload.dropFirst(todoPrefix.count))
+    }
+
+    static func setId(from payload: String) -> Int? {
+        guard payload.hasPrefix(setPrefix) else {
+            return nil
+        }
+
+        return Int(payload.dropFirst(setPrefix.count))
+    }
+}
+
+/// A todo or a set, ordered against each other so a set can render between two todos.
+private enum OrderedChild: Identifiable {
+    case todo(Todo)
+    case set(Set)
+
+    var id: String {
+        switch self {
+        case .todo(let todo): return DragPayload.todo(id: todo.id)
+        case .set(let set): return DragPayload.set(id: set.id)
+        }
+    }
+
+    var order: Double {
+        switch self {
+        case .todo(let todo): return todo.order
+        case .set(let set): return set.order
+        }
+    }
+
+    var todoId: Int? {
+        if case .todo(let todo) = self {
+            return todo.id
+        }
+
+        return nil
+    }
+
+    var setId: Int? {
+        if case .set(let set) = self {
+            return set.id
+        }
+
+        return nil
+    }
+}
+
+/// Combines the not-done todos and child sets that live directly under `parentId` into one ordered list.
+/// `parentId == nil` means top-level; a set whose declared parent no longer exists is treated as top-level too.
+private func combinedChildren(sets: [Set], todos: [Todo], parentId: Int?) -> [OrderedChild] {
+    let childTodos = todos.filter { $0.setId == parentId && !$0.done }
+
+    let childSets: [Set]
+    if let parentId {
+        childSets = sets.filter { $0.subsetId == parentId }
+    } else {
+        let setIds = Swift.Set(sets.map(\.id))
+        childSets = sets.filter { set in
+            guard let subsetId = set.subsetId else {
+                return true
+            }
+
+            return !setIds.contains(subsetId)
+        }
+    }
+
+    return (childTodos.map(OrderedChild.todo) + childSets.map(OrderedChild.set))
+        .sorted { $0.order < $1.order }
+}
+
+/// A fractional order key that sorts immediately before `target`, without needing to renumber any siblings.
+private func orderForInsertion(before target: OrderedChild, siblings: [OrderedChild]) -> Double {
+    guard let targetIndex = siblings.firstIndex(where: { $0.id == target.id }), targetIndex > 0 else {
+        return target.order - 1
+    }
+
+    return (siblings[targetIndex - 1].order + target.order) / 2
+}
+
+private func orderForAppend(after siblings: [OrderedChild]) -> Double {
+    (siblings.map(\.order).max() ?? -1) + 1
+}
+
+private enum DropIndicator: Equatable {
+    case before(String)
+    case insideSet(Int?)
+}
+
+/// Handles an imprecise drop anywhere in a set's body (or the Inbox): nests a dragged set as a child,
+/// or assigns a dragged todo to it, appending it after the scope's current last item.
+private struct SetDropDelegate: DropDelegate {
+    let targetSetId: Int?
+    let sets: [Set]
+    let todos: [Todo]
+    let setStore: SetStore
     let todoStore: TodoStore
+    @Binding var dropIndicator: DropIndicator?
+
+    func dropEntered(info: DropInfo) {
+        dropIndicator = .insideSet(targetSetId)
+    }
+
+    func dropExited(info: DropInfo) {
+        if dropIndicator == .insideSet(targetSetId) {
+            dropIndicator = nil
+        }
+    }
 
     func performDrop(info: DropInfo) -> Bool {
         guard let provider = info.itemProviders(for: [.text]).first else {
             return false
         }
 
+        dropIndicator = nil
+
         provider.loadObject(ofClass: NSString.self) { reading, _ in
-            guard let idString = reading as? String, let draggedId = Int(idString) else {
+            guard let payload = reading as? String else {
                 return
             }
 
             DispatchQueue.main.async {
-                do {
-                    try todoStore.moveTodo(draggedId: draggedId, beforeId: targetTodoId)
-                } catch {
-                    print("Failed to reorder todo: \(error)")
+                let siblings = combinedChildren(sets: sets, todos: todos, parentId: targetSetId)
+                let newOrder = orderForAppend(after: siblings)
+
+                if let draggedTodoId = DragPayload.todoId(from: payload) {
+                    do {
+                        try todoStore.moveTodo(draggedId: draggedTodoId, toSetId: targetSetId, order: newOrder)
+                    } catch {
+                        print("Failed to move todo: \(error)")
+                    }
+                } else if let draggedSetId = DragPayload.setId(from: payload) {
+                    do {
+                        try setStore.moveSet(draggedId: draggedSetId, toSubsetId: targetSetId, order: newOrder)
+                    } catch {
+                        print("Failed to move set: \(error)")
+                    }
                 }
             }
         }
@@ -87,25 +222,70 @@ private struct TodoReorderDropDelegate: DropDelegate {
     }
 }
 
-private struct TodoSetDropDelegate: DropDelegate {
-    let setId: Int?
+/// Handles a precise drop onto a specific todo or set: positions the dragged item immediately
+/// before `target`, adopting target's parent scope. Works for any combination of dragged/target kinds,
+/// which is what lets a set land between two todos (or vice versa).
+private struct ReorderDropDelegate: DropDelegate {
+    let target: OrderedChild
+    let siblings: [OrderedChild]
+    let sets: [Set]
+    let todos: [Todo]
+    let setStore: SetStore
     let todoStore: TodoStore
+    @Binding var dropIndicator: DropIndicator?
+
+    private var targetParentId: Int? {
+        switch target {
+        case .todo(let todo): return todo.setId
+        case .set(let set): return set.subsetId
+        }
+    }
+
+    func dropEntered(info: DropInfo) {
+        dropIndicator = .before(target.id)
+    }
+
+    func dropExited(info: DropInfo) {
+        if dropIndicator == .before(target.id) {
+            dropIndicator = nil
+        }
+    }
 
     func performDrop(info: DropInfo) -> Bool {
         guard let provider = info.itemProviders(for: [.text]).first else {
             return false
         }
 
+        dropIndicator = nil
+
         provider.loadObject(ofClass: NSString.self) { reading, _ in
-            guard let idString = reading as? String, let draggedId = Int(idString) else {
+            guard let payload = reading as? String else {
                 return
             }
 
             DispatchQueue.main.async {
-                do {
-                    try todoStore.moveTodo(draggedId: draggedId, toSetId: setId)
-                } catch {
-                    print("Failed to move todo: \(error)")
+                let newOrder = orderForInsertion(before: target, siblings: siblings)
+
+                if let draggedTodoId = DragPayload.todoId(from: payload) {
+                    guard draggedTodoId != target.todoId else {
+                        return
+                    }
+
+                    do {
+                        try todoStore.moveTodo(draggedId: draggedTodoId, toSetId: targetParentId, order: newOrder)
+                    } catch {
+                        print("Failed to reorder todo: \(error)")
+                    }
+                } else if let draggedSetId = DragPayload.setId(from: payload) {
+                    guard draggedSetId != target.setId else {
+                        return
+                    }
+
+                    do {
+                        try setStore.moveSet(draggedId: draggedSetId, toSubsetId: targetParentId, order: newOrder)
+                    } catch {
+                        print("Failed to reorder set: \(error)")
+                    }
                 }
             }
         }
@@ -160,9 +340,12 @@ struct AddTodoUI: View {
         }
 
         do {
+            let siblings = combinedChildren(sets: setStore.sets, todos: todoStore.todos, parentId: selectedSetId)
+
             try todoStore.addTodo(
                 content: trimmedContent,
-                setId: selectedSetId
+                setId: selectedSetId,
+                order: orderForAppend(after: siblings)
             )
 
             todoContent = ""
@@ -173,35 +356,25 @@ struct AddTodoUI: View {
 }
 
 struct SetUI: View {
+    private let setStore = SetStore.shared
     private let todoStore = TodoStore.shared
     let sets: [Set]
     let todos: [Todo]
 
     @State private var collapsedSetIds: Swift.Set<Int> = []
     @State private var isDoneCollapsed = false
+    @State private var dropIndicator: DropIndicator?
 
-    private var setIds: Swift.Set<Int> {
-        Swift.Set(sets.map(\.id))
-    }
-
-    private var topLevelSets: [Set] {
-        sets
-            .filter { set in
-                guard let subsetId = set.subsetId else {
-                    return true
-                }
-
-                return !setIds.contains(subsetId)
-            }
-            .sorted { $0.id < $1.id }
-    }
-
-    private var todosWithoutSet: [Todo] {
-        todos.filter { $0.setId == nil && !$0.done }
+    private var topLevelChildren: [OrderedChild] {
+        combinedChildren(sets: sets, todos: todos, parentId: nil)
     }
 
     private var doneTodos: [Todo] {
         todos.filter(\.done)
+    }
+
+    private var doneChildren: [OrderedChild] {
+        doneTodos.map(OrderedChild.todo).sorted { $0.order < $1.order }
     }
 
     var body: some View {
@@ -210,16 +383,24 @@ struct SetUI: View {
                 Text("Inbox")
                     .font(.headline)
 
-                ForEach(todosWithoutSet) { todo in
-                    TodoUI(todo: todo)
+                ForEach(topLevelChildren) { child in
+                    switch child {
+                    case .todo(let todo):
+                        TodoUI(todo: todo, todos: todos, siblings: topLevelChildren, dropIndicator: $dropIndicator)
+                    case .set(let set):
+                        SetSectionView(set: set, sets: sets, todos: todos, siblings: topLevelChildren, indentLevel: 0, collapsedSetIds: $collapsedSetIds, dropIndicator: $dropIndicator)
+                    }
                 }
             }
+            .padding(8)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .onDrop(of: [.text], delegate: TodoSetDropDelegate(setId: nil, todoStore: todoStore))
-
-            ForEach(topLevelSets) { set in
-                SetSectionView(set: set, sets: sets, todos: todos, indentLevel: 0, collapsedSetIds: $collapsedSetIds)
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(Color.accentColor, lineWidth: 2)
+                    .opacity(dropIndicator == .insideSet(nil) ? 1 : 0)
             }
+            .animation(.easeInOut(duration: 0.15), value: dropIndicator)
+            .onDrop(of: [.text], delegate: SetDropDelegate(targetSetId: nil, sets: sets, todos: todos, setStore: setStore, todoStore: todoStore, dropIndicator: $dropIndicator))
 
             if !doneTodos.isEmpty {
                 doneSection
@@ -252,7 +433,7 @@ struct SetUI: View {
 
             if !isDoneCollapsed {
                 ForEach(doneTodos) { todo in
-                    TodoUI(todo: todo)
+                    TodoUI(todo: todo, todos: todos, siblings: doneChildren, dropIndicator: $dropIndicator)
                 }
             }
         }
@@ -273,24 +454,39 @@ private struct SetSectionView: View {
     let set: Set
     let sets: [Set]
     let todos: [Todo]
+    let siblings: [OrderedChild]
     let indentLevel: Int
     @Binding var collapsedSetIds: Swift.Set<Int>
+    @Binding var dropIndicator: DropIndicator?
 
     private var isCollapsed: Bool {
         collapsedSetIds.contains(set.id)
     }
 
-    private var setTodos: [Todo] {
-        todos.filter { $0.setId == set.id && !$0.done }
+    private var children: [OrderedChild] {
+        combinedChildren(sets: sets, todos: todos, parentId: set.id)
     }
 
-    private var childSets: [Set] {
-        sets
-            .filter { $0.subsetId == set.id }
-            .sorted { $0.id < $1.id }
+    private var showsReorderSeparator: Bool {
+        dropIndicator == .before(DragPayload.set(id: set.id))
     }
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if showsReorderSeparator {
+                Rectangle()
+                    .fill(Color.accentColor)
+                    .frame(height: 2)
+                    .clipShape(Capsule())
+                    .padding(.leading, CGFloat(indentLevel) * 24)
+            }
+
+            sectionBox
+        }
+        .animation(.easeInOut(duration: 0.15), value: dropIndicator)
+    }
+
+    private var sectionBox: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Button {
@@ -305,6 +501,10 @@ private struct SetSectionView: View {
 
                 Text(set.name)
                     .font(.headline)
+                    .onDrag {
+                        NSItemProvider(object: DragPayload.set(id: set.id) as NSString)
+                    }
+                    .onDrop(of: [.text], delegate: ReorderDropDelegate(target: .set(set), siblings: siblings, sets: sets, todos: todos, setStore: setStore, todoStore: todoStore, dropIndicator: $dropIndicator))
 
                 Spacer()
 
@@ -323,12 +523,13 @@ private struct SetSectionView: View {
             }
 
             if !isCollapsed {
-                ForEach(setTodos) { todo in
-                    TodoUI(todo: todo)
-                }
-
-                ForEach(childSets) { childSet in
-                    SetSectionView(set: childSet, sets: sets, todos: todos, indentLevel: indentLevel + 1, collapsedSetIds: $collapsedSetIds)
+                ForEach(children) { child in
+                    switch child {
+                    case .todo(let todo):
+                        TodoUI(todo: todo, todos: todos, siblings: children, dropIndicator: $dropIndicator)
+                    case .set(let childSet):
+                        SetSectionView(set: childSet, sets: sets, todos: todos, siblings: children, indentLevel: indentLevel + 1, collapsedSetIds: $collapsedSetIds, dropIndicator: $dropIndicator)
+                    }
                 }
             }
         }
@@ -338,10 +539,15 @@ private struct SetSectionView: View {
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(Color(hex: set.color ?? "#D1D1D6").opacity(0.55), lineWidth: 2)
+                .stroke(isDropTarget ? Color.accentColor : Color(hex: set.color ?? "#D1D1D6").opacity(0.55), lineWidth: isDropTarget ? 3 : 2)
         }
+        .animation(.easeInOut(duration: 0.15), value: dropIndicator)
         .padding(.leading, CGFloat(indentLevel) * 24)
-        .onDrop(of: [.text], delegate: TodoSetDropDelegate(setId: set.id, todoStore: todoStore))
+        .onDrop(of: [.text], delegate: SetDropDelegate(targetSetId: set.id, sets: sets, todos: todos, setStore: setStore, todoStore: todoStore, dropIndicator: $dropIndicator))
+    }
+
+    private var isDropTarget: Bool {
+        dropIndicator == .insideSet(set.id)
     }
 
     private func deleteSet() {
@@ -365,6 +571,9 @@ struct TodoUI: View {
     @ObservedObject private var setStore = SetStore.shared
     private let todoStore = TodoStore.shared
     let todo: Todo
+    let todos: [Todo]
+    fileprivate let siblings: [OrderedChild]
+    @Binding fileprivate var dropIndicator: DropIndicator?
 
     @State private var isEditing = false
     @State private var editedContent = ""
@@ -374,7 +583,25 @@ struct TodoUI: View {
         setStore.sets.sorted { $0.id < $1.id }
     }
 
+    private var showsDropSeparator: Bool {
+        dropIndicator == .before(DragPayload.todo(id: todo.id))
+    }
+
     var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if showsDropSeparator {
+                Rectangle()
+                    .fill(Color.accentColor)
+                    .frame(height: 2)
+                    .clipShape(Capsule())
+            }
+
+            todoRow
+        }
+        .animation(.easeInOut(duration: 0.15), value: dropIndicator)
+    }
+
+    private var todoRow: some View {
         HStack {
             Button {
                 toggleDone()
@@ -409,9 +636,9 @@ struct TodoUI: View {
                         startEditing()
                     }
                     .onDrag {
-                        NSItemProvider(object: String(todo.id) as NSString)
+                        NSItemProvider(object: DragPayload.todo(id: todo.id) as NSString)
                     }
-                    .onDrop(of: [.text], delegate: TodoReorderDropDelegate(targetTodoId: todo.id, todoStore: todoStore))
+                    .onDrop(of: [.text], delegate: ReorderDropDelegate(target: .todo(todo), siblings: siblings, sets: setStore.sets, todos: todos, setStore: setStore, todoStore: todoStore, dropIndicator: $dropIndicator))
             }
 
             if todo.setId == nil, !availableSets.isEmpty {
@@ -463,8 +690,10 @@ struct TodoUI: View {
 
     private func assignToSet(_ setId: Int) {
         do {
+            let scopeSiblings = combinedChildren(sets: setStore.sets, todos: todos, parentId: setId)
+
             try todoStore.updateTodo(
-                Todo(id: todo.id, setId: setId, content: todo.content, done: todo.done)
+                Todo(id: todo.id, setId: setId, content: todo.content, done: todo.done, order: orderForAppend(after: scopeSiblings))
             )
         } catch {
             print("Failed to assign todo to set: \(error)")
@@ -492,7 +721,7 @@ struct TodoUI: View {
 
         do {
             try todoStore.updateTodo(
-                Todo(id: todo.id, setId: todo.setId, content: trimmedContent, done: todo.done)
+                Todo(id: todo.id, setId: todo.setId, content: trimmedContent, done: todo.done, order: todo.order)
             )
         } catch {
             print("Failed to update todo content: \(error)")
@@ -598,10 +827,13 @@ struct CreateSetModal: View {
         }
 
         do {
+            let siblings = combinedChildren(sets: setStore.sets, todos: TodoStore.shared.todos, parentId: parentSetId)
+
             _ = try setStore.addSet(
                 name: setName.trimmingCharacters(in: .whitespacesAndNewlines),
                 color: selectedColor.toHex() ?? "#007AFF",
-                subsetId: parentSetId
+                subsetId: parentSetId,
+                order: orderForAppend(after: siblings)
             )
             dismiss()
         } catch {
